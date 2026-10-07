@@ -1,0 +1,133 @@
+diff --git a/node_modules/expo-video/android/src/main/java/expo/modules/video/VideoModule.kt b/node_modules/expo-video/android/src/main/java/expo/modules/video/VideoModule.kt
+index 71b8501..16fbc56 100644
+--- a/node_modules/expo-video/android/src/main/java/expo/modules/video/VideoModule.kt
++++ b/node_modules/expo-video/android/src/main/java/expo/modules/video/VideoModule.kt
+@@ -335,6 +335,15 @@ class VideoModule : Module() {
+         }
+       }
+ 
++      // Jumps to the live edge (the default live position, honoring the MediaItem's LiveConfiguration).
++      Function("seekToLiveEdge") { ref: VideoPlayer ->
++        appContext.mainQueue.launch {
++          if (ref.player.isCurrentMediaItemLive) {
++            ref.player.seekToDefaultPosition()
++          }
++        }
++      }
++
+       AsyncFunction("generateThumbnailsAsync") Coroutine { ref: VideoPlayer, times: List<Duration>, options: VideoThumbnailOptions? ->
+         return@Coroutine ref.toMetadataRetriever().safeUse {
+           val bitmaps = times.map { time ->
+diff --git a/node_modules/expo-video/android/src/main/java/expo/modules/video/playbackService/VideoMediaSessionCallback.kt b/node_modules/expo-video/android/src/main/java/expo/modules/video/playbackService/VideoMediaSessionCallback.kt
+index 1ca90e0..67499ef 100644
+--- a/node_modules/expo-video/android/src/main/java/expo/modules/video/playbackService/VideoMediaSessionCallback.kt
++++ b/node_modules/expo-video/android/src/main/java/expo/modules/video/playbackService/VideoMediaSessionCallback.kt
+@@ -16,19 +16,17 @@ class VideoMediaSessionCallback : MediaSession.Callback {
+     controller: MediaSession.ControllerInfo
+   ): MediaSession.ConnectionResult {
+     try {
+-      // TODO @behenate: For now we're only allowing seek forward and back by 10 seconds and going to the
+-      //  beginning of the video. In the future we should add more customization options for the users.
+       return MediaSession.ConnectionResult.AcceptedResultBuilder(session)
+         .setAvailablePlayerCommands(
+           MediaSession.ConnectionResult.DEFAULT_PLAYER_COMMANDS.buildUpon()
+-            .add(Player.COMMAND_SEEK_FORWARD)
+-            .add(Player.COMMAND_SEEK_BACK)
+-            .build()
+-        )
+-        .setAvailableSessionCommands(
+-          MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
+-            .add(SessionCommand(ExpoVideoPlaybackService.SEEK_BACKWARD_COMMAND, Bundle.EMPTY))
+-            .add(SessionCommand(ExpoVideoPlaybackService.SEEK_FORWARD_COMMAND, Bundle.EMPTY))
++            .removeAll(
++              Player.COMMAND_SEEK_TO_PREVIOUS,
++              Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
++              Player.COMMAND_SEEK_TO_NEXT,
++              Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
++              Player.COMMAND_SEEK_BACK,
++              Player.COMMAND_SEEK_FORWARD
++            )
+             .build()
+         )
+         .build()
+diff --git a/node_modules/expo-video/android/src/main/java/expo/modules/video/records/VideoSource.kt b/node_modules/expo-video/android/src/main/java/expo/modules/video/records/VideoSource.kt
+index b0bfb49..d365cfe 100644
+--- a/node_modules/expo-video/android/src/main/java/expo/modules/video/records/VideoSource.kt
++++ b/node_modules/expo-video/android/src/main/java/expo/modules/video/records/VideoSource.kt
+@@ -28,7 +28,8 @@ class VideoSource(
+   @Field var metadata: VideoMetadata? = null,
+   @Field var headers: Map<String, String>? = null,
+   @Field var useCaching: Boolean = false,
+-  @Field val contentType: ContentType = ContentType.AUTO
++  @Field val contentType: ContentType = ContentType.AUTO,
++  @Field var liveTargetOffset: Double? = null
+ ) : Record, Serializable {
+   private fun toMediaId(): String {
+     return "uri:${this.uri}" +
+@@ -63,6 +64,15 @@ class VideoSource(
+           throw UnsupportedDRMTypeException(it.type)
+         }
+       }
++      liveTargetOffset?.takeIf { it > 0 }?.let { seconds ->
++        setLiveConfiguration(
++          MediaItem.LiveConfiguration.Builder()
++            .setTargetOffsetMs((seconds * 1000).toLong())
++            .setMinPlaybackSpeed(0.95f)
++            .setMaxPlaybackSpeed(1.05f)
++            .build()
++        )
++      }
+       setMediaMetadata(
+         MediaMetadata.Builder().apply {
+           metadata?.let { data ->
+diff --git a/node_modules/expo-video/android/src/main/java/expo/modules/video/utils/MediaSessionUtils.kt b/node_modules/expo-video/android/src/main/java/expo/modules/video/utils/MediaSessionUtils.kt
+index b69e694..80b0b66 100644
+--- a/node_modules/expo-video/android/src/main/java/expo/modules/video/utils/MediaSessionUtils.kt
++++ b/node_modules/expo-video/android/src/main/java/expo/modules/video/utils/MediaSessionUtils.kt
+@@ -1,14 +1,45 @@
+ package expo.modules.video.utils
+ 
+ import android.content.Context
++import androidx.annotation.OptIn
++import androidx.media3.common.ForwardingPlayer
++import androidx.media3.common.Player
++import androidx.media3.common.util.UnstableApi
+ import androidx.media3.exoplayer.ExoPlayer
+ import androidx.media3.session.MediaSession
++import expo.modules.video.playbackService.VideoMediaSessionCallback
+ 
+ /**
+  * Creates a basic foreground media session, for receiving commands like play/pause from bluetooth devices.
+  */
+ internal fun buildBasicMediaSession(context: Context, player: ExoPlayer): MediaSession {
+-  return MediaSession.Builder(context, player)
++  return MediaSession.Builder(context, PlayPauseOnlyPlayer(player))
+     .setId("ExpoVideoBasicMediaSession_${player.hashCode()}")
++    .setCallback(VideoMediaSessionCallback())
+     .build()
+ }
++
++/**
++ * Exposes only play/pause to the system (Picture in Picture window, notification, Bluetooth),
++ * hiding previous/next and seek commands, which don't make sense for a live stream.
++ */
++@OptIn(UnstableApi::class)
++private class PlayPauseOnlyPlayer(player: Player) : ForwardingPlayer(player) {
++  override fun getAvailableCommands(): Player.Commands =
++    super.getAvailableCommands().buildUpon().removeAll(*HIDDEN_COMMANDS).build()
++
++  override fun isCommandAvailable(command: Int): Boolean =
++    command !in HIDDEN_COMMANDS && super.isCommandAvailable(command)
++
++  private companion object {
++    val HIDDEN_COMMANDS = intArrayOf(
++      Player.COMMAND_SEEK_TO_PREVIOUS,
++      Player.COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM,
++      Player.COMMAND_SEEK_TO_NEXT,
++      Player.COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
++      Player.COMMAND_SEEK_BACK,
++      Player.COMMAND_SEEK_FORWARD,
++      Player.COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM
++    )
++  }
++}
